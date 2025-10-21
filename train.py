@@ -155,9 +155,11 @@ class DownBlock(nn.Module):
         x = self.res1(x, t_emb)
         x = self.res2(x, t_emb)
         x = self.attn(x)
-        skip = x
-        x = self.down(x)
-        return x, skip
+        x_down = self.down(x)
+        # 关键：把下采样后的特征作为 skip，保证与解码端输入 x 同尺寸
+        skip = x_down
+        return x_down, skip
+
 
 
 class UpBlock(nn.Module):
@@ -170,6 +172,7 @@ class UpBlock(nn.Module):
         self.up   = nn.ConvTranspose2d(out_ch, out_ch, 4, stride=2, padding=1)
 
     def forward(self, x, skip, t_emb):
+        assert x.shape[-2:] == skip.shape[-2:], f"UpBlock spatial mismatch: {x.shape[-2:]} vs {skip.shape[-2:]}"
         x = torch.cat([x, skip], dim=1)
         x = self.res1(x, t_emb)
         x = self.res2(x, t_emb)
