@@ -64,38 +64,186 @@ class LinearNoiseScheduler:
         sqrt_one_minus_alphas_cumprod_t = self.sqrt_one_minus_alphas_cumprod[t].view(-1, 1, 1, 1)
         return sqrt_alphas_cumprod_t * x_start + sqrt_one_minus_alphas_cumprod_t * noise
 
+# --- 替换 train.py 中原来的 SimpleUNet 为下方实现 -----------------
 
-# -------------------------
-# 简单 U-Net 网络
-# -------------------------
-class SimpleUNet(nn.Module):
-    def __init__(self, channels=3, base_channels=64):
+# 正弦时间嵌入（位置编码）
+class SinusoidalPosEmb(nn.Module):
+    def __init__(self, dim: int):
         super().__init__()
-        self.inc = nn.Conv2d(channels, base_channels, 3, 1, 1)
-        self.down1 = nn.Conv2d(base_channels, base_channels * 2, 4, 2, 1)
-        self.down2 = nn.Conv2d(base_channels * 2, base_channels * 4, 4, 2, 1)
-        self.bot1 = nn.Conv2d(base_channels * 4, base_channels * 4, 3, 1, 1)
-        self.up1 = nn.ConvTranspose2d(base_channels * 4, base_channels * 2, 4, 2, 1)
-        self.up2 = nn.ConvTranspose2d(base_channels * 2, base_channels, 4, 2, 1)
-        self.outc = nn.Conv2d(base_channels, channels, 3, 1, 1)
-        self.time_embed = nn.Sequential(
-            nn.Linear(1, base_channels * 4),
-            nn.ReLU(),
-            nn.Linear(base_channels * 4, base_channels * 4),
+        self.dim = dim
+
+    def forward(self, t):  # t: [B]
+        device = t.device
+        half = self.dim // 2
+        freqs = torch.exp(
+            torch.arange(half, device=device, dtype=torch.float32)
+            * -(math.log(10000.0) / (half - 1))
+        )
+        args = t.float().unsqueeze(1) * freqs.unsqueeze(0)  # [B, half]
+        emb = torch.cat([args.sin(), args.cos()], dim=-1)   # [B, dim]
+        return emb
+
+
+class ResBlock(nn.Module):
+    def __init__(self, in_ch, out_ch, time_dim, dropout=0.0):
+        super().__init__()
+        self.in_ch = in_ch
+        self.out_ch = out_ch
+
+        self.norm1  = nn.GroupNorm(32, in_ch)
+        self.act1   = nn.SiLU()
+        self.conv1  = nn.Conv2d(in_ch, out_ch, 3, padding=1)
+
+        self.time_mlp = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(time_dim, out_ch)
         )
 
+        self.norm2  = nn.GroupNorm(32, out_ch)
+        self.act2   = nn.SiLU()
+        self.dropout= nn.Dropout(dropout)
+        self.conv2  = nn.Conv2d(out_ch, out_ch, 3, padding=1)
+
+        self.skip = nn.Conv2d(in_ch, out_ch, 1) if in_ch != out_ch else nn.Identity()
+
+    def forward(self, x, t_emb):  # t_emb: [B, time_dim]
+        h = self.conv1(self.act1(self.norm1(x)))
+        # 注入时间（FiLM 的加法偏置）
+        h = h + self.time_mlp(t_emb).unsqueeze(-1).unsqueeze(-2)
+        h = self.conv2(self.dropout(self.act2(self.norm2(h))))
+        return h + self.skip(x)
+
+
+class SelfAttention2D(nn.Module):
+    def __init__(self, ch, num_heads=4):
+        super().__init__()
+        self.num_heads = num_heads
+        self.norm = nn.GroupNorm(32, ch)
+        self.qkv  = nn.Conv2d(ch, ch * 3, 1)
+        self.proj = nn.Conv2d(ch, ch, 1)
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+        h = self.norm(x)
+        qkv = self.qkv(h)  # [B, 3C, H, W]
+        q, k, v = qkv.chunk(3, dim=1)
+
+        # [B, heads, C//heads, HW]
+        def reshape_heads(t):
+            t = t.view(B, self.num_heads, C // self.num_heads, H * W)
+            return t
+
+        q, k, v = map(reshape_heads, (q, k, v))
+        attn = torch.softmax(
+            (q.transpose(2, 3) @ k) / math.sqrt(C // self.num_heads), dim=-1
+        )  # [B, heads, HW, HW]
+        out = (attn @ v.transpose(2, 3)).transpose(2, 3)  # [B, heads, C//heads, HW]
+        out = out.contiguous().view(B, C, H * W).view(B, C, H, W)
+        out = self.proj(out)
+        return out + x
+
+
+class DownBlock(nn.Module):
+    def __init__(self, in_ch, out_ch, time_dim, with_attn=False, dropout=0.0):
+        super().__init__()
+        self.res1 = ResBlock(in_ch,  out_ch, time_dim, dropout)
+        self.res2 = ResBlock(out_ch, out_ch, time_dim, dropout)
+        self.attn = SelfAttention2D(out_ch) if with_attn else nn.Identity()
+        self.down = nn.Conv2d(out_ch, out_ch, 4, stride=2, padding=1)
+
+    def forward(self, x, t_emb):
+        x = self.res1(x, t_emb)
+        x = self.res2(x, t_emb)
+        x = self.attn(x)
+        skip = x
+        x = self.down(x)
+        return x, skip
+
+
+class UpBlock(nn.Module):
+    def __init__(self, in_ch, out_ch, time_dim, with_attn=False, dropout=0.0):
+        super().__init__()
+        # 注意：in_ch = 当前通道 + skip 通道
+        self.res1 = ResBlock(in_ch,  out_ch, time_dim, dropout)
+        self.res2 = ResBlock(out_ch, out_ch, time_dim, dropout)
+        self.attn = SelfAttention2D(out_ch) if with_attn else nn.Identity()
+        self.up   = nn.ConvTranspose2d(out_ch, out_ch, 4, stride=2, padding=1)
+
+    def forward(self, x, skip, t_emb):
+        x = torch.cat([x, skip], dim=1)
+        x = self.res1(x, t_emb)
+        x = self.res2(x, t_emb)
+        x = self.attn(x)
+        x = self.up(x)
+        return x
+
+
+class SimpleUNet(nn.Module):
+    """
+    输入:  x [B,3,H,W], t [B]
+    输出:  预测噪声 eps_hat，与训练/推理接口保持一致
+    结构:  128 -> 64 -> 32 -> 16 分辨率，瓶颈带 Attention，Up/Down 两次
+    """
+    def __init__(self, channels=3, base_channels=64, dropout=0.0):
+        super().__init__()
+        ch = base_channels
+        time_dim = ch * 4
+
+        # 时间嵌入
+        self.time_embed = nn.Sequential(
+            SinusoidalPosEmb(ch),
+            nn.Linear(ch, time_dim),
+            nn.SiLU(),
+            nn.Linear(time_dim, time_dim),
+        )
+
+        # 输入卷积
+        self.inc = nn.Conv2d(channels, ch, 3, padding=1)
+
+        # Down: (128->64), (64->32), (32->16)
+        self.down1 = DownBlock(ch,     ch,     time_dim, with_attn=False, dropout=dropout)
+        self.down2 = DownBlock(ch,     ch*2,   time_dim, with_attn=False, dropout=dropout)
+        self.down3 = DownBlock(ch*2,   ch*4,   time_dim, with_attn=True,  dropout=dropout)  # 16x16 加注意力
+
+        # Bottleneck
+        self.bot1 = ResBlock(ch*4, ch*4, time_dim, dropout)
+        self.bot_attn = SelfAttention2D(ch*4)
+        self.bot2 = ResBlock(ch*4, ch*4, time_dim, dropout)
+
+        # Up: (16->32), (32->64), (64->128)
+        self.up1  = UpBlock(in_ch=ch*4 + ch*4, out_ch=ch*2, time_dim=time_dim, with_attn=True,  dropout=dropout)
+        self.up2  = UpBlock(in_ch=ch*2 + ch*2, out_ch=ch,   time_dim=time_dim, with_attn=False, dropout=dropout)
+        self.up3  = UpBlock(in_ch=ch   + ch,   out_ch=ch,   time_dim=time_dim, with_attn=False, dropout=dropout)
+
+        # 输出层
+        self.out_norm = nn.GroupNorm(32, ch)
+        self.out_act  = nn.SiLU()
+        self.outc     = nn.Conv2d(ch, channels, 3, padding=1)
+
     def forward(self, x, t):
-        # t: [B]
-        t = t.float().unsqueeze(-1) / 1000.0
-        t_emb = self.time_embed(t).unsqueeze(-1).unsqueeze(-1)
-        x1 = F.relu(self.inc(x))
-        x2 = F.relu(self.down1(x1))
-        x3 = F.relu(self.down2(x2))
-        x3 = x3 + t_emb
-        x3 = F.relu(self.bot1(x3))
-        x = F.relu(self.up1(x3))
-        x = F.relu(self.up2(x))
-        return self.outc(x)
+        # t: [B] => time embedding
+        t_emb = self.time_embed(t)
+
+        # encoder
+        x0 = self.inc(x)                     # [B, ch, 128,128]
+        d1, s1 = self.down1(x0, t_emb)       # -> [B, ch,   64,64], s1: [B, ch, 128,128]
+        d2, s2 = self.down2(d1, t_emb)       # -> [B, 2ch,  32,32], s2: [B, ch,   64,64]
+        d3, s3 = self.down3(d2, t_emb)       # -> [B, 4ch,  16,16], s3: [B, 2ch,  32,32]
+
+        # bottleneck
+        b  = self.bot1(d3, t_emb)
+        b  = self.bot_attn(b)
+        b  = self.bot2(b, t_emb)
+
+        # decoder
+        u1 = self.up1(b,  s3, t_emb)         # -> [B, 2ch, 32,32]
+        u2 = self.up2(u1, s2, t_emb)         # -> [B, ch,  64,64]
+        u3 = self.up3(u2, s1, t_emb)         # -> [B, ch, 128,128]
+
+        out = self.outc(self.out_act(self.out_norm(u3)))
+        return out
+# --- 替换结束 ----------------------------------------------------
+
 
 
 # -------------------------
