@@ -11,33 +11,33 @@ from train import SimpleUNet, LinearNoiseScheduler  # 直接复用train.py定义
 
 @torch.no_grad()
 def p_sample(model, x_t, t, scheduler):
-    """
-    单步逆扩散采样：
-    x_{t-1} = 1/sqrt(alpha_t) * (x_t - ((1 - alpha_t)/sqrt(1 - alpha_bar_t)) * eps_theta(x_t, t)) + sigma_t * z
-    """
     betas = scheduler.betas
     alphas = scheduler.alphas
     alphas_cumprod = scheduler.alphas_cumprod
+    alphas_cumprod_prev = scheduler.alphas_cumprod_prev
 
-    b = x_t.shape[0]
     t = t.long()
-
     beta_t = betas[t].view(-1, 1, 1, 1)
     alpha_t = alphas[t].view(-1, 1, 1, 1)
     alpha_bar_t = alphas_cumprod[t].view(-1, 1, 1, 1)
+    alpha_bar_t_prev = alphas_cumprod_prev[t].view(-1, 1, 1, 1)
 
-    noise_pred = model(x_t, t)
-    coef1 = 1 / torch.sqrt(alpha_t)
-    coef2 = (1 - alpha_t) / torch.sqrt(1 - alpha_bar_t)
-    mean = coef1 * (x_t - coef2 * noise_pred)
+    # 预测噪声
+    eps = model(x_t, t)
 
-    # 最后一帧不再加噪声
-    if (t == 0).all():
-        return mean
-    else:
-        noise = torch.randn_like(x_t)
-        sigma_t = torch.sqrt(beta_t)
-        return mean + sigma_t * noise
+    # 均值项（Ho et al. 公式 11）
+    mean = (1.0 / torch.sqrt(alpha_t)) * (x_t - (beta_t / torch.sqrt(1 - alpha_bar_t)) * eps)
+
+    # 后验方差（Ho et al. 公式 7）
+    posterior_var = beta_t * (1 - alpha_bar_t_prev) / (1 - alpha_bar_t)
+    posterior_std = torch.sqrt(torch.clamp(posterior_var, min=1e-20))
+
+    # t=0 不加噪声
+    nonzero_mask = (t != 0).float().view(-1, 1, 1, 1)
+    noise = torch.randn_like(x_t)
+    x_prev = mean + nonzero_mask * posterior_std * noise
+    return x_prev
+
 
 
 @torch.no_grad()
