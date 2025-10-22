@@ -1,6 +1,7 @@
 # train.py
 # 训练一个基础 DDPM（去噪扩散概率模型）
 
+from email.policy import strict
 import os
 import glob
 import math
@@ -261,12 +262,16 @@ def train_ddpm(
     timesteps=1000,
     save_every=10,   # every 10 epoch
     save_dir="./checkpoints",
+    ckpt=None, 
 ):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     dataset = ImageFolderDataset(dataset_path, image_size)
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=4, drop_last=True)
 
     model = SimpleUNet().to(device)
+    if ckpt is not None and os.path.exists(ckpt):
+        model.load_state_dict(torch.load(ckpt, map_location=device, weights_only=True), strict=False)
+        print(f"load model checkpoint from path: {ckpt}")
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     noise_scheduler = LinearNoiseScheduler(timesteps=timesteps, device=device)
 
@@ -288,11 +293,11 @@ def train_ddpm(
             optimizer.step()
             pbar.set_postfix(loss=loss.item())
 
-        if epoch % save_every == 0:
-            torch.save(model.state_dict(), os.path.join(save_dir, f"ddpm_epoch_{epoch+1}.pt"))
-    torch.save(model.state_dict(), os.path.join(save_dir, f"last.pt"))
+        # if epoch % save_every == 0:
+        #     torch.save(model.state_dict(), os.path.join(save_dir, f"ddpm_epoch_{epoch+1}.pt"))
+        torch.save(model.state_dict(), os.path.join(save_dir, f"last.pt"))  # save every epoch
     print("训练完成 ✅")
 
 
 if __name__ == "__main__":
-    train_ddpm()
+    train_ddpm(ckpt="./checkpoints/last.pt")

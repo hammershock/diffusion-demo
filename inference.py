@@ -66,11 +66,11 @@ def sample_ddpm(
     save_dir="./samples",
     timesteps=1000,
     image_size=128,
-    num_images=4,
+    num_images=8,
 ):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = SimpleUNet().to(device)
-    model.load_state_dict(torch.load(ckpt_path, map_location=device))
+    model.load_state_dict(torch.load(ckpt_path, map_location=device, weights_only=True), strict=False)
     model.eval()
 
     scheduler = LinearNoiseScheduler(timesteps=timesteps, device=device)
