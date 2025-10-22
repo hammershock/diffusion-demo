@@ -1,7 +1,6 @@
 # train.py
 # 训练一个基础 DDPM（去噪扩散概率模型）
 
-from email.policy import strict
 import os
 import glob
 import math
@@ -256,7 +255,7 @@ class SimpleUNet(nn.Module):
 def train_ddpm(
     dataset_path="/cache/hanmo/anime_face",
     image_size=128,
-    batch_size=64,
+    batch_size=256,
     epochs=30,
     lr=1e-4,
     timesteps=1000,
