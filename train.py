@@ -268,6 +268,7 @@ def train_ddpm(
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=4, drop_last=True)
 
     model = SimpleUNet().to(device)
+    # load checkpoint
     if ckpt is not None and os.path.exists(ckpt):
         model.load_state_dict(torch.load(ckpt, map_location=device, weights_only=True), strict=False)
         print(f"load model checkpoint from path: {ckpt}")
@@ -281,15 +282,15 @@ def train_ddpm(
         pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{epochs}")
         for imgs in pbar:
             imgs = imgs.to(device)
-            b = imgs.shape[0]
-            t = torch.randint(0, timesteps, (b,), device=device).long()
-            noise = torch.randn_like(imgs)
-            x_noisy = noise_scheduler.q_sample(imgs, t, noise)
-            noise_pred = model(x_noisy, t)
-            loss = F.mse_loss(noise_pred, noise)
+            b = imgs.shape[0]  # batchsize
+            t = torch.randint(0, timesteps, (b,), device=device).long()  # generate random t
+            noise = torch.randn_like(imgs)  # generate noise
+            x_noisy = noise_scheduler.q_sample(imgs, t, noise)  # generate noisy image
+            noise_pred = model(x_noisy, t)  # let the model predict the noise generated
+            loss = F.mse_loss(noise_pred, noise)  # compute loss
             optimizer.zero_grad()
             loss.backward()
-            optimizer.step()
+            optimizer.step()  # do optimization
             pbar.set_postfix(loss=loss.item())
 
         # if epoch % save_every == 0:
